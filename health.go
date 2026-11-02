@@ -188,6 +188,72 @@ func judgeHealth(fails int, ok bool) healthVerdict {
 	return healthVerdict{fails: 0, repair: true}
 }
 
+// Repair backoff.
+//
+// A single failed repair is not evidence that the whole egress is down: the
+// relay pool, the WARP underlay and the local core can each hiccup on their own.
+// What the log does show when the egress really is down is a repair storm -
+// every ~15 minutes the guard tears the session apart, burns four relay
+// attempts, and ends up disconnected (28 repair episodes / 55 attempts / 24
+// distinct relays failing in one recorded session). Repeating that at the same
+// cadence costs the user their connection for minutes at a time and hammers
+// every candidate with handshakes.
+//
+// So consecutive failed repairs double the wait before the next one, capped, and
+// any success resets it. The ceiling keeps a genuinely recovered network from
+// waiting too long: after the cap the guard still tries once per window.
+const (
+	// repairBackoffBase is the wait after the first failed repair. It starts
+	// above the check interval on purpose: the guard has just spent minutes
+	// proving the egress is unusable, and re-running the same rotation seconds
+	// later only burns the same candidates.
+	repairBackoffBase = 2 * time.Minute
+	// repairBackoffMax caps the doubling so a long outage still retries
+	// regularly instead of drifting to hours between attempts.
+	repairBackoffMax = 30 * time.Minute
+	// repairBackoffReset is how long a session must stay healthy before the
+	// backoff is forgotten. A tunnel that answers once and dies again must not
+	// look like a fresh start to the next repair.
+	repairBackoffReset = 10 * time.Minute
+)
+
+// repairBackoff returns how long to wait before the next repair after `fails`
+// consecutive failed repairs (0 = no failed repair yet).
+//
+// The progression is 2m, 4m, 8m, 16m, then 30m from there on. It is a pure
+// function so the schedule can be pinned by a test instead of rediscovered
+// from a log.
+func repairBackoff(fails int) time.Duration {
+	if fails <= 0 {
+		return 0
+	}
+	d := repairBackoffBase
+	for i := 1; i < fails; i++ {
+		d *= 2
+		if d >= repairBackoffMax {
+			return repairBackoffMax
+		}
+	}
+	if d > repairBackoffMax {
+		return repairBackoffMax
+	}
+	return d
+}
+
+// insuranceWait records one more consecutive failed repair and schedules the
+// next attempt. It returns the wait just scheduled, so the caller can log it.
+//
+// Kept separate from the loop body because it mutates two pieces of state in
+// lockstep, and getting that wrong is exactly how a backoff turns into either
+// no backoff (counter never advances) or a permanent stall (nextRepairAt never
+// reached).
+func insuranceWait(repairFails *int, nextRepairAt *time.Time) time.Duration {
+	*repairFails++
+	wait := repairBackoff(*repairFails)
+	*nextRepairAt = time.Now().Add(wait)
+	return wait
+}
+
 // checkDataPlane asks the question status used to assume the answer to: does a
 // real HTTPS request through the local mixed port complete right now? A v6-only
 // session is probed against a v6 literal, because its public sources are v4
@@ -765,6 +831,16 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 	logf(fmt.Sprintf("数据面守护已启动 (port=%d)", opts.mixedPort))
 
 	var fails int
+	// repairFails counts consecutive failed repairs, nextRepairAt is the
+	// earliest time the guard may tear the session down again, and
+	// healthySince marks when the data plane last started answering. All three
+	// feed repairBackoff: without them a down egress is re-rotated at the same
+	// cadence forever, which is the repair storm the log records.
+	var (
+		repairFails  int
+		nextRepairAt time.Time
+		healthySince time.Time
+	)
 	// psiphonRestarts / psiphonUnderlayFails count consecutive Psiphon-side
 	// repairs for a Psiphon session; both reset the moment the data plane
 	// answers (see psiphon_health.go).
@@ -803,15 +879,39 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			if res.OK {
 				psiphonRestarts = 0
 				psiphonUnderlayFails = 0
+				// A stretch that has held for repairBackoffReset means the egress
+				// really recovered: forget the earlier repair failures so one bad
+				// patch late in a long session does not inherit a wait inflated
+				// by failures from hours ago. The deadline goes with the counter,
+				// otherwise a future nextRepairAt would keep suppressing repairs
+				// that the cleared counter says are allowed again.
+				if healthySince.IsZero() {
+					healthySince = time.Now()
+				}
+				if repairFails > 0 && time.Since(healthySince) >= repairBackoffReset {
+					repairFails = 0
+					nextRepairAt = time.Time{}
+				}
 				if verdict.recovered {
 					logf("数据面已恢复")
 				}
 				continue
 			}
+			healthySince = time.Time{}
 			logf(fmt.Sprintf("数据面探测失败 (%d/%d): %v", fails, healthFailLimit, res.Err))
 			continue
 		}
 		logf(fmt.Sprintf("数据面探测失败 (%d/%d): %v", healthFailLimit, healthFailLimit, res.Err))
+		// Hold off a repeat repair while the last ones failed. Rotating the
+		// relay pool again seconds after it was exhausted only tears down the
+		// session that is still limping along and burns the same candidates;
+		// the wait doubles per consecutive failure. The check itself keeps
+		// running, so a tunnel that comes back on its own still clears `fails`.
+		if wait := time.Until(nextRepairAt); wait > 0 {
+			logf(fmt.Sprintf("上次修复失败，%s 内不再重建会话（跳过本轮修复）", wait.Round(time.Second)))
+			fails = 0
+			continue
+		}
 		// An OpenVPN session is repaired by rotating the VPN Gate relay, not by
 		// rotating the underlay: the relay is the part that churns, and a bare
 		// WARP re-connect would silently drop the exit the user chose.
@@ -822,15 +922,25 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			logf("OpenVPN 出口失效：更换 VPN Gate 节点并重建会话…")
 			if _, ok := repairOpenVPNOnce(ctx, st, logf); ok {
 				fails = 0
+				repairFails = 0
+				nextRepairAt = time.Time{}
 				continue
 			}
 			if done, derr := loadState(); derr == nil && !done.Connected {
 				logf("会话已由用户断开，退出守护")
 				return nil
 			}
-			logf("没有可用的 VPN Gate 节点，结束会话")
-			giveUp(logf)
-			return nil
+			// The relay pool is exhausted, but that does not prove the egress
+			// is gone for good: VPN Gate relays churn on their own schedule and
+			// a refreshed list minutes later routinely works. Keep the session
+			// and retry on the backoff instead of disconnecting the user and
+			// making them click Connect again (which is what "结束会话" did).
+			if wait := insuranceWait(&repairFails, &nextRepairAt); wait > 0 {
+				logf(fmt.Sprintf("本轮修复失败，保留当前会话，%s 后重试（第 %d 次连续失败）",
+					wait.Round(time.Second), repairFails))
+			}
+			fails = 0
+			continue
 		}
 		// A Psiphon session is repaired by RESTARTING Psiphon, never by rotating
 		// the WARP underlay: the latter would silently swap the final exit back
@@ -909,6 +1019,8 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			return nil
 		}
 		if _, ok := repairOnce(ctx, repairOpts, st.Endpoint, tried, logf); ok {
+			repairFails = 0
+			nextRepairAt = time.Time{}
 			continue
 		}
 		// Every cached candidate failed: the cache is stale as a whole. One
@@ -917,6 +1029,8 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 		logf("缓存端点全部失活，重新扫描…")
 		repairOpts.scanNow = true
 		if _, ok := repairOnce(ctx, repairOpts, st.Endpoint, tried, logf); ok {
+			repairFails = 0
+			nextRepairAt = time.Time{}
 			continue
 		}
 		// Not every exhausted repair means the network gave up on us - the
@@ -927,8 +1041,18 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			logf("会话已由用户断开，退出守护")
 			return nil
 		}
-		giveUp(logf)
-		return nil
+		// The candidate pool is exhausted, but WARP endpoints rotate constantly
+		// and a freshly scanned set minutes later routinely connects. Tearing
+		// the session down forced the user to notice and click Connect again,
+		// once per outage - and the recorded log shows that happening every
+		// quarter hour. Keep the session, hold the retry on the backoff, and
+		// let the next attempt re-scan.
+		if wait := insuranceWait(&repairFails, &nextRepairAt); wait > 0 {
+			logf(fmt.Sprintf("本轮修复失败，保留当前会话，%s 后重试（第 %d 次连续失败）",
+				wait.Round(time.Second), repairFails))
+		}
+		fails = 0
+		continue
 	}
 }
 
