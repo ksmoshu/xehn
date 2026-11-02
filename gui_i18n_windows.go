@@ -316,7 +316,7 @@ var enStrings = map[string]string{
 	"内核更新：mihomo 是独立进程，可以重新下载覆盖 core 目录下的 mihomo.exe，也可以手动替换后点「重新探测内核」。":               "The core is a separate process: download it again to replace core\\mihomo.exe, or swap the file and press re-probe.",
 	"便携模式：程序目录可以整体复制走，配置与缓存就在 exe 同级目录。":                                               "Portable: copy the whole program folder; settings and cache live next to the exe.",
 
-	// About: GitHub links, remote control, licence notice.
+	// About: GitHub links, licence notice.
 	"项目链接":       "Project links",
 	"项目主页":       "Project page",
 	"打开项目主页":     "Open project page",
@@ -324,16 +324,6 @@ var enStrings = map[string]string{
 	"问题反馈":       "Issues",
 	"第三方声明":      "Third-party notices",
 	"内核来源":       "Core source",
-	"远程控制":       "Remote control",
-	"控制码":        "Control code",
-	"复制控制码":      "Copy code",
-	"立即检查":       "Check now",
-	"最近检查":       "Last check",
-	"正常":         "Active",
-	"已停用":        "Stopped",
-	"未检查":        "Not checked",
-	"未连上":        "unreachable",
-	"控制码已复制到剪贴板": "Control code copied to the clipboard",
 	"我已知晓":       "I understand",
 	"使用须知":       "Before you start",
 	"本软件开源免费，仅供学习交流使用，禁止售卖！":         "This software is free and open source, for learning and exchange only. Selling it is forbidden.",
@@ -341,13 +331,6 @@ var enStrings = map[string]string{
 	"不提供、不代理任何服务器资源，请遵守当地法律法规。":      "it provides and proxies no server resources. Follow your local laws.",
 	"如果你是通过付费渠道拿到本软件的，说明你被骗了；":       "If you paid someone for this software, you were scammed;",
 	"请到项目主页免费下载：":                    "download it free from the project page:",
-	"客户端已停用":                         "Client stopped",
-	"控制码：":                           "Control code: ",
-	"如有疑问，请到项目主页反馈：":                 "Questions? Open an issue at ",
-	"远程控制：本机控制码已被停用":                 "Remote control: this control code has been stopped",
-	"远程控制：客户端已停用，无法连接":               "Remote control: the client is stopped and cannot connect",
-	"远程控制：停用名单不可达（网络受限），沿用上次结果":      "Remote control: stop list unreachable, keeping the previous verdict",
-	"远程控制：控制码正常":                     "Remote control: control code is active",
 	"缺少 Geo · 点击下载":                  "No geo data · click to download",
 	"缺少 Geo 数据：点开「规则预设」选「绕过大陆」会自动下载": "Geo data missing: picking \u201cBypass mainland\u201d downloads it",
 	"缺少 Geo 数据，开始下载（约 13 MB）…":       "Geo data missing, downloading (~13 MB)…",
@@ -355,7 +338,6 @@ var enStrings = map[string]string{
 	"Geo 数据下载失败: ":                   "Geo data download failed: ",
 	"无法定位核心目录: ":                     "Cannot locate the core folder: ",
 	"已保存：":                           "Saved: ",
-	"远程控制状态保存失败":                     "Could not save the remote-control state",
 	"本程序只在你自己的设备上配置一条加密隧道，不提供、不代理任何服务器资源；程序按「现状」提供，不对可用性、速度或适用性作任何承诺。": "This program only configures an encrypted tunnel on your own device and provides no server resources. It is offered as-is, with no promise of availability, speed or fitness for purpose.",
 
 	// Logs.

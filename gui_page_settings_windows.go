@@ -522,27 +522,20 @@ func (u *natUI) paintAbout(c *walk.Canvas, x, y, w float64) {
 	u.button(c, rx+16, row1+146, bw, 34, "upd:core", tr("检查/下载内核"), true, !u.m.coreBusy)
 	u.button(c, rx+16+bw+10, row1+146, bw, 34, "upd:refresh", tr("重新探测内核"), false, !u.m.coreBusy)
 
-	// Row 2 — updates, and the remote-control identity this install carries.
+	// Row 2 — client updates. The card spans the full row now: the
+	// remote-control identity card that shared it is gone.
 	y2 := row2
-	cy = u.card(c, x, y2, half, aboutRow2H, tr("客户端更新"))
-	u.kv(c, x, cy, half, tr("当前版本"), versionWithBuild())
-	u.kv(c, x, cy+24, half, tr("最新版本"), orEmpty(u.m.updLatest, tr("尚未检查")))
-	u.kv(c, x, cy+48, half, tr("状态"), orEmpty(u.m.updNote, tr("点击下方按钮检查更新")))
+	cy = u.card(c, x, y2, w, aboutRow2H, tr("客户端更新"))
+	u.kv(c, x, cy, w, tr("当前版本"), versionWithBuild())
+	u.kv(c, x, cy+24, w, tr("最新版本"), orEmpty(u.m.updLatest, tr("尚未检查")))
+	u.kv(c, x, cy+48, w, tr("状态"), orEmpty(u.m.updNote, tr("点击下方按钮检查更新")))
 	updID, updLabel := "upd:check", tr("检查更新")
 	if u.m.updAvail != "" {
 		updID, updLabel = "upd:install", trf("立即更新到 v%s", u.m.updAvail)
 	}
-	u.button(c, x+16, y2+140, bw, 34, updID, updLabel, true, !u.m.updBusy)
-	u.button(c, x+16+bw+10, y2+140, bw, 34, "about:releases", tr("打开发布页"), false, true)
-
-	cy = u.card(c, rx, y2, half, aboutRow2H, tr("远程控制"))
-	u.kv(c, rx, cy, half, tr("控制码"), orEmpty(u.m.set.ControlCode, tr("未知")))
-	u.txt(c, rx+16, cy+24, 84, 22, tr("状态"), u.f.f9, th.dim)
-	stText, stColor := u.controlStatus()
-	u.txt(c, rx+16+84, cy+24, half-32-84, 22, stText, u.f.f9, stColor)
-	u.kv(c, rx, cy+48, half, tr("最近检查"), controlCheckedText(u.m.control))
-	u.button(c, rx+16, y2+140, bw, 34, "about:copycode", tr("复制控制码"), false, true)
-	u.button(c, rx+16+bw+10, y2+140, bw, 34, "about:checkcontrol", tr("立即检查"), true, !u.m.controlBusy)
+	bw2 := (w - 16 - 16 - 10) / 2
+	u.button(c, x+16, y2+140, bw2, 34, updID, updLabel, true, !u.m.updBusy)
+	u.button(c, x+16+bw2+10, y2+140, bw2, 34, "about:releases", tr("打开发布页"), false, true)
 
 	// Row 3 — every address the page offers, as one clickable list.
 	y3 := row3
@@ -565,30 +558,4 @@ func (u *natUI) paintAbout(c *walk.Canvas, x, y, w float64) {
 	u.txt(c, x+2, yf+20, w-4, 18,
 		tr("本程序只在你自己的设备上配置一条加密隧道，不提供、不代理任何服务器资源；程序按「现状」提供，不对可用性、速度或适用性作任何承诺。"),
 		u.f.f8, th.dim)
-}
-
-// controlStatus is the About card's verdict line: stopped outranks everything,
-// then "checked and fine", then "never reached the list".
-func (u *natUI) controlStatus() (string, walk.Color) {
-	switch {
-	case u.m.control.Stopped:
-		return tr("已停用"), th.warn
-	case u.m.control.Reached:
-		return tr("正常"), th.ok
-	default:
-		return tr("未检查"), th.dim
-	}
-}
-
-// controlCheckedText renders the last check as a compact timestamp, and says so
-// when that check never got an answer.
-func controlCheckedText(st controlState) string {
-	if st.CheckedAt.IsZero() {
-		return tr("尚未检查")
-	}
-	s := st.CheckedAt.Format("01-02 15:04")
-	if !st.Reached {
-		s += " · " + tr("未连上")
-	}
-	return s
 }

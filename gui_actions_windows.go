@@ -515,16 +515,6 @@ func (u *natUI) actionAbout(id string) {
 		} else {
 			u.addLog(tr("诊断信息已复制到剪贴板"), false)
 		}
-	case "about:copycode":
-		// The code is what the maintainer needs to stop (or un-stop) this
-		// install, so copying it beats asking the user to retype 16 characters.
-		if err := setClipboardText(u.m.set.ControlCode); err != nil {
-			u.addLog(tr("复制失败")+": "+err.Error(), true)
-		} else {
-			u.addLog(tr("控制码已复制到剪贴板"), false)
-		}
-	case "about:checkcontrol":
-		u.startControlCheck(true)
 	case "about:opendata":
 		// Still used by the Logs page's diagnostics tab.
 		u.openDataDir()
