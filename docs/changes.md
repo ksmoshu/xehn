@@ -82,9 +82,56 @@
 
 ---
 
-## 3. 未完成项
+## 3. 配置校验加固（已完成）
 
-- `docs/rea-detection.md`、`docs/binary-inventory.md`（二进制端点与依赖清单）尚未生成。
-- 配置生成输入校验（端口范围、MTU、DNS 合法性）尚未加固。
-- 系统代理快照/还原的失败路径尚未加固。
-- 前述 4 条既有 `go vet` 告警未处理（属既有问题，不在本次范围）。
+**问题**：GUI 写入的 `settings.json` 有三处未校验就进入渲染器：
+
+1. `APIPort == MixedPort` 时用 `APIPort = MixedPort + 1` 消解冲突，而 `MixedPort = 65535`
+   会把它推成 **65536**，一个非法端口。
+2. `dns_custom` / `domain_direct` / `domain_proxy` **完全无校验**：手改 settings.json 写入
+   非 IP 的 DNS 项会让 mihomo 拒绝整份配置；域名项若带 `||`、`/`、`:`、引号等字符，
+   会生成永不匹配的 `DOMAIN-SUFFIX` 规则或破坏 YAML。
+
+**证据**：改动前 `settings.go:318-320`（端口 +1 溢出）、`settings.go:437`（`o.dns` 直取原文）、
+`settings.go:444-445`（域名列表直达渲染器），`normalize()`（`settings.go:237-353`）中无相关校验。
+
+**改法**：
+
+- `normalize()` 增加三行守卫，接入两个新函数：
+  - `validDNSServers()` —— `net.ParseIP` 过滤，非法项丢弃，输出统一为 `逗号+空格` 形式；
+  - `validDomainList()` / `validDomainToken()` —— 只接受 `字母数字 - _ .` 与 `*.` 通配前缀，
+    拒绝空标签、首尾点、连字符开头/结尾的标签、以及 YAML 指示符。
+- 端口冲突改为就近避让：能 +1 就 +1，`65535` 时改为 −1。
+
+**测试**：新增 `settings_validate_test.go`，16 个非法域名用例、10 个 DNS 用例、6 个域名列表用例、
+5 组端口用例。**测试立即抓到一个真实缺陷**：`-example.com` 曾被放行（DNS 标签不得以连字符
+开头），已修复。全 PASS。
+
+**验证**：`go build ./...` exit 0；`go test ./...` exit 0；`go vet` 仅 4 条既有告警。
+
+**风险**：非法值现在会被**静默丢弃**而非报错。这是刻意的：一个手改错的文件不应让程序无法启动。
+用户若发现某项设置"没生效"，日志与设置页仍显示规范化后的值。
+
+---
+
+## 4. 系统代理还原：审计结论（未改动）
+
+**审计结果**：既有实现已足够健壮，本次未改动。理由：
+
+- `SetSystemProxy` 会捕获完整快照（含 PAC URL 与 auto-detect），并识别"快照其实是我们自己
+  上次留下的"并替换为干净基线（`proxy_windows.go:126-130`）。
+- 还原走三级降级（直写注册表 → WinINet API → `reg.exe`），每次写入都**读回验证**
+  （`applyProxyValues`），避免安全软件静默回滚被当成成功。
+- 快照丢失时有 `SystemProxyEnabledAt()` 兜底清理（`connect.go:1436-1445`）。
+- 仍失败时打印明确告警，提示手动关闭或提权运行。
+- 启动时 `healStaleProxy()` 处理"上次被强杀"的残留（`gui_native_windows.go:531-550`），
+  且先用 TCP 探测确认端口无人监听，避免误清正在工作的会话。
+
+---
+
+## 5. 剩余未做项
+
+- 4 条既有 `go vet` 告警（`connect.go:1196/1205` 的 context 泄漏、`gui_chrome_windows.go:292/303`
+  的 `unsafe.Pointer`）未处理。属既有问题，且 `unsafe.Pointer` 涉及 Win32 回调，改动风险高于收益。
+- `GOOS=linux` 编译失败（`shortVersion`、`tr` 定义在 `_windows.go` 中）。已在原始 `c319e7c`
+  树上复现同样失败，确认为既有问题；本项目为 Windows 专用。

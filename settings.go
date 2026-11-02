@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -315,8 +316,15 @@ func (s *clientSettings) normalize() {
 	if s.APIPort < 1 || s.APIPort > 65535 {
 		s.APIPort = core.DefaultAPIPort
 	}
+	// The two ports must differ (mihomo binds both). "MixedPort+1" overflows
+	// to an invalid port at the top of the range, so step down instead of up
+	// when there is no room above.
 	if s.APIPort == s.MixedPort {
-		s.APIPort = s.MixedPort + 1
+		if s.MixedPort < 65535 {
+			s.APIPort = s.MixedPort + 1
+		} else {
+			s.APIPort = s.MixedPort - 1
+		}
 	}
 	// 0 means "let the core pick" (mihomo's own default), which is what an
 	// unset MTU has always meant here.
@@ -336,6 +344,16 @@ func (s *clientSettings) normalize() {
 		s.OpenVPNRegion = ""
 	}
 	s.OpenVPNNode = strings.TrimSpace(s.OpenVPNNode)
+	// The custom DNS list reaches mihomo as a nameserver list, and a hand-edited
+	// settings.json could put anything there. Keep only entries that parse as an
+	// IP; drop the rest rather than render a config mihomo refuses to load.
+	s.DNSCustom = validDNSServers(s.DNSCustom)
+	// Domain lists become DOMAIN-SUFFIX rules. A stray "||" or a value with
+	// mihomo's own separators in it would produce a rule that either never
+	// matches or corrupts the generated YAML, so normalize them to plain
+	// suffix tokens here.
+	s.DomainDirect = validDomainList(s.DomainDirect)
+	s.DomainProxy = validDomainList(s.DomainProxy)
 	out := s.Starred[:0]
 	for _, e := range s.Starred {
 		if e = strings.TrimSpace(e); e != "" {
@@ -348,6 +366,81 @@ func (s *clientSettings) normalize() {
 // domainDirectList / domainProxyList are the two domain suffix lists.
 func (s clientSettings) domainDirectList() []string { return fieldList(s.DomainDirect) }
 func (s clientSettings) domainProxyList() []string  { return fieldList(s.DomainProxy) }
+
+// validDNSServers keeps only entries of a comma-separated DNS list that parse as
+// an IP address, and rewrites the field in the comma+space form the renderer
+// expects. An unparsable entry is dropped instead of being handed to mihomo,
+// which would reject the whole config over one bad nameserver - a settings file
+// typo must not cost the user their connection.
+func validDNSServers(raw string) string {
+	items := fieldList(raw)
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		if net.ParseIP(it) == nil {
+			continue
+		}
+		out = append(out, it)
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, ", ")
+}
+
+// validDomainList keeps only plausible domain-suffix tokens. Each entry becomes
+// a DOMAIN-SUFFIX rule, so a token carrying YAML syntax or mihomo's own rule
+// punctuation would either never match or break the generated config. The
+// allowed shape is deliberately narrow: letters, digits, dash, underscore and
+// dot, plus a leading "*." wildcard, which mihomo accepts.
+func validDomainList(raw string) string {
+	items := fieldList(raw)
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		if !validDomainToken(it) {
+			continue
+		}
+		out = append(out, it)
+	}
+	return strings.Join(out, ", ")
+}
+
+// validDomainToken reports whether one suffix token is safe to emit as a
+// DOMAIN-SUFFIX value.
+func validDomainToken(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	// "*." is mihomo's wildcard form for "this domain and every subdomain".
+	if strings.HasPrefix(s, "*.") {
+		s = s[2:]
+		if s == "" {
+			return false
+		}
+	}
+	// A bare label or dotted name. Reject anything that is not in the narrow
+	// set, which excludes '||' , '/', ':' , ',', quotes and YAML indicators.
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	// No empty labels ("a..b") and no leading/trailing dot.
+	if strings.HasPrefix(s, ".") || strings.HasSuffix(s, ".") || strings.Contains(s, "..") {
+		return false
+	}
+	// A DNS label may not start or end with a hyphen; mihomo's suffix matcher
+	// and real resolvers both treat such a name as bogus, and accepting it
+	// here would silently create a rule that never matches.
+	for _, label := range strings.Split(s, ".") {
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+	}
+	return true
+}
 
 // fieldList splits a comma/semicolon/whitespace separated list, de-duplicated.
 func fieldList(raw string) []string {
