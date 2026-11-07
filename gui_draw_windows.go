@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 
@@ -16,12 +17,37 @@ import (
 // u.r/u.s, so a widget never has to know the display DPI.
 // ---------------------------------------------------------------------------
 
+// widePenKey identifies a cached geometric pen: same colour at the same width
+// is the same stroke, and the cache is keyed on both because the width is
+// baked into the handle at creation time.
+type widePenKey struct {
+	col   walk.Color
+	width int
+}
+
+// disposeGdiCache releases every cached brush and pen. Called once, when the
+// window is torn down: the handles are owned for the window's life, so nothing
+// else disposes them.
+func (u *natUI) disposeGdiCache() {
+	for _, b := range u.brushes {
+		b.Dispose()
+	}
+	for _, p := range u.pens {
+		p.Dispose()
+	}
+	for _, p := range u.wpens {
+		p.Dispose()
+	}
+	u.brushes = nil
+	u.pens = nil
+	u.wpens = nil
+}
+
 func (u *natUI) fillRound(c *walk.Canvas, col walk.Color, r walk.Rectangle, rad float64) {
 	b := u.brush(col)
 	if b == nil {
 		return
 	}
-	defer b.Dispose()
 	_ = c.FillRoundedRectanglePixels(b, r, walk.Size{Width: u.s(rad), Height: u.s(rad)})
 }
 
@@ -30,7 +56,6 @@ func (u *natUI) strokeRound(c *walk.Canvas, col walk.Color, r walk.Rectangle, ra
 	if p == nil {
 		return
 	}
-	defer p.Dispose()
 	_ = c.DrawRoundedRectanglePixels(p, r, walk.Size{Width: u.s(rad), Height: u.s(rad)})
 }
 
@@ -39,26 +64,78 @@ func (u *natUI) fillRect(c *walk.Canvas, col walk.Color, r walk.Rectangle) {
 	if b == nil {
 		return
 	}
-	defer b.Dispose()
 	_ = c.FillRectanglePixels(b, r)
 }
 
-// brush hands back a solid brush or nil. A nil result must never reach a paint
-// call: GDI does run out of handles, and a nil brush used to turn one failed
-// allocation into a nil-pointer panic that closed the window mid-connect.
+// ---------------------------------------------------------------------------
+// Cached GDI brushes and pens.
+//
+// A full repaint used to allocate one brush per fill: 124 direct call sites
+// plus vgradPx (64 bands) and paintWallpaper's five softEllipses (26 rings
+// each) came to roughly 320 GDI handles per frame, each created and destroyed
+// again on the next frame. With the status loop invalidating every two
+// seconds, the process burned through Windows' 10,000-handle quota in a few
+// minutes - after which every fill failed and the window painted solid black.
+//
+// The handles are now owned for the life of the window: one brush per distinct
+// colour and one pen per distinct colour, created on first use and reused
+// after. The palette is a few dozen colours, so the cache stays bounded and a
+// frame allocates nothing at all.
+//
+// Callers must NOT dispose what these return: the handles belong to the window
+// and disposeGdiCache releases them at shutdown. That is why the defer
+// Dispose calls at each paint site are gone.
+// ---------------------------------------------------------------------------
+
 func (u *natUI) brush(col walk.Color) *walk.SolidColorBrush {
+	if u.brushes == nil {
+		return nil
+	}
+	// Quantise before looking up: gradients feed this hundreds of colours
+	// computed from floats, and two runs of the same ramp can differ in the
+	// low bits, so an exact key would miss and allocate a fresh handle for a
+	// colour that is visually identical to one already in the cache. Rounding
+	// each channel to a step keeps the cache bounded by the number of
+	// *distinguishable* colours instead of by the float noise.
+	col = quantiseColor(col)
+	if b, ok := u.brushes[col]; ok {
+		return b
+	}
 	b, err := walk.NewSolidColorBrush(col)
 	if err != nil {
 		return nil
 	}
+	u.brushes[col] = b
 	return b
 }
 
+// quantiseColor rounds each channel to the nearest multiple of
+// gdiColorQuantum. At 8, GDI's own 5-bit-per-channel resolution is already
+// coarser than the step, so nothing visibly changes while the cache stops
+// growing on float noise.
+func quantiseColor(c walk.Color) walk.Color {
+	q := func(v byte) byte {
+		return byte((int(v) + gdiColorQuantum/2) / gdiColorQuantum * gdiColorQuantum)
+	}
+	return walk.RGB(q(c.R()), q(c.G()), q(c.B()))
+}
+
+// gdiColorQuantum is the channel step used by quantiseColor.
+const gdiColorQuantum = 8
+
 func (u *natUI) pen(col walk.Color) *walk.CosmeticPen {
+	if u.pens == nil {
+		return nil
+	}
+	col = quantiseColor(col)
+	if p, ok := u.pens[col]; ok {
+		return p
+	}
 	p, err := walk.NewCosmeticPen(walk.PenSolid, col)
 	if err != nil {
 		return nil
 	}
+	u.pens[col] = p
 	return p
 }
 
@@ -66,20 +143,29 @@ func (u *natUI) pen(col walk.Color) *walk.CosmeticPen {
 // design pixel. Icons, the ring around the connect button and the traffic
 // curves all need strokes a cosmetic (always 1px) pen draws invisibly thin.
 //
-// The brush is disposed here: GeometricPen only remembers the colour values
-// (logbrush builds a LOGBRUSH from them, no handle), so keeping the brush alive
-// just leaked one GDI handle per thick stroke. At sixteen repaints a second
-// that exhausted the process's handle quota in well under a minute.
+// The brush comes from the window's cache and must not be disposed here:
+// GeometricPen only reads the LOGBRUSH values, and disposing a cached brush
+// would leave a dangling handle for the next fill that asks for that colour.
+//
+// The pen itself is cached by (colour, width) for the same reason the brushes
+// are - a thick stroke used to allocate a fresh geometric pen on every frame.
 func (u *natUI) penW(col walk.Color, w float64) *walk.GeometricPen {
 	b := u.brush(col)
 	if b == nil {
 		return nil
 	}
-	defer b.Dispose()
-	p, err := walk.NewGeometricPen(walk.PenSolid, int(w+0.5), b)
+	if u.wpens == nil {
+		return nil
+	}
+	key := widePenKey{col: quantiseColor(col), width: int(w + 0.5)}
+	if p, ok := u.wpens[key]; ok {
+		return p
+	}
+	p, err := walk.NewGeometricPen(walk.PenSolid, key.width, b)
 	if err != nil {
 		return nil
 	}
+	u.wpens[key] = p
 	return p
 }
 
@@ -87,7 +173,7 @@ func (u *natUI) penW(col walk.Color, w float64) *walk.GeometricPen {
 // rounded rectangles blending from the shadow tint back to the surface, which
 // is what GDI+ (no blur, no alpha in Color) can do.
 //
-// Kept deliberately faint — on a light grey canvas macOS cards are separated by
+// Kept deliberately faint 鈥?on a light grey canvas macOS cards are separated by
 // a hairline and a 2-3% shadow, not by the heavy blue halo the old mock used.
 func (u *natUI) shadowRound(c *walk.Canvas, r walk.Rectangle, rad float64, tint walk.Color, base walk.Color) {
 	for i := 3; i >= 1; i-- {
@@ -109,7 +195,6 @@ func (u *natUI) circleStrokeW(c *walk.Canvas, col walk.Color, cx, cy, r, width f
 	if p == nil {
 		return
 	}
-	defer p.Dispose()
 	if err := c.DrawEllipsePixels(p, u.r(cx-r, cy-r, 2*r, 2*r)); err != nil {
 		// fall through: a failed decorative stroke must not break the frame
 		_ = err
@@ -125,7 +210,6 @@ func (u *natUI) polylineW(c *walk.Canvas, col walk.Color, pts []walk.Point, widt
 	if p == nil {
 		return
 	}
-	defer p.Dispose()
 	_ = c.DrawPolylinePixels(p, pts)
 }
 
@@ -150,7 +234,7 @@ func (u *natUI) powerGlyph(c *walk.Canvas, cx, cy, size float64, col walk.Color)
 	w := size * 0.13
 	// Stem: a filled bar through the gap at the top of the ring.
 	u.fillRound(c, col, u.r(cx-w/2, cy-r-0.5, w, r*0.95), w/2)
-	// Ring: 300° of circle, open at the top (from -60° to 240°).
+	// Ring: 300掳 of circle, open at the top (from -60掳 to 240掳).
 	u.arcW(c, col, cx, cy, r, w, -62, 242)
 }
 
@@ -202,7 +286,7 @@ func (u *natUI) curveSamples(x, y, w, h float64, s []int64, peak int64, steps in
 }
 
 // curveFill shades the area under a curve with a very light tint by painting
-// thin columns from the curve down to the baseline — GDI+ has no alpha here,
+// thin columns from the curve down to the baseline 鈥?GDI+ has no alpha here,
 // so the "low opacity" of the mock is a colour mixed toward the card.
 func (u *natUI) curveFill(c *walk.Canvas, pts []walk.Point, baseline float64, col walk.Color, step float64) {
 	for i := 0; i+1 < len(pts); i++ {
@@ -228,7 +312,6 @@ func (u *natUI) circleFill(c *walk.Canvas, col walk.Color, cx, cy, r float64) {
 	if b == nil {
 		return
 	}
-	defer b.Dispose()
 	_ = c.FillEllipsePixels(b, u.r(cx-r, cy-r, 2*r, 2*r))
 }
 
@@ -239,7 +322,6 @@ func (u *natUI) ellipseFill(c *walk.Canvas, col walk.Color, cx, cy, ew, eh float
 	if b == nil {
 		return
 	}
-	defer b.Dispose()
 	_ = c.FillEllipsePixels(b, u.r(cx-ew, cy-eh, 2*ew, 2*eh))
 }
 
@@ -269,7 +351,6 @@ func (u *natUI) circleStroke(c *walk.Canvas, col walk.Color, cx, cy, r float64) 
 	if p == nil {
 		return
 	}
-	defer p.Dispose()
 	_ = c.DrawEllipsePixels(p, u.r(cx-r, cy-r, 2*r, 2*r))
 }
 
@@ -286,7 +367,6 @@ func (u *natUI) line(c *walk.Canvas, col walk.Color, x1, y1, x2, y2 float64) {
 	if p == nil {
 		return
 	}
-	defer p.Dispose()
 	_ = c.DrawLinePixels(p, u.p(x1, y1), u.p(x2, y2))
 }
 
@@ -497,7 +577,6 @@ func (u *natUI) thickLine(c *walk.Canvas, col walk.Color, x1, y1, x2, y2, w floa
 	if p == nil {
 		return
 	}
-	defer p.Dispose()
 	_ = c.DrawLinePixels(p, u.p(x1, y1), u.p(x2, y2))
 }
 
@@ -507,7 +586,6 @@ func (u *natUI) thickRound(c *walk.Canvas, col walk.Color, r walk.Rectangle, rad
 	if p == nil {
 		return
 	}
-	defer p.Dispose()
 	_ = c.DrawRoundedRectanglePixels(p, r, walk.Size{Width: u.s(rad), Height: u.s(rad)})
 }
 
@@ -625,32 +703,29 @@ func shadowTint() walk.Color {
 	return mix(th.window, rx(86, 108, 140), 0.30)
 }
 
-// vgrad fills a rectangle with a top-to-bottom colour blend, painted as
-// horizontal bands. Used for the content canvas behind the cards.
+// vgrad fills a rectangle with a top-to-bottom colour blend. Used for the
+// content canvas behind the cards.
+//
+// Same reasoning as vgradPx: GDI's GradientFill replaces 48 mixed bands, each
+// of which used to allocate a brush of a colour derived from a float mix and
+// therefore never hit the cache.
 func (u *natUI) vgrad(c *walk.Canvas, x, y, w, h float64, from, to walk.Color) {
-	const steps = 48
-	bh := h / float64(steps)
-	for i := 0; i < steps; i++ {
-		t := float64(i) / float64(steps-1)
-		u.fillRect(c, mix(from, to, t), u.r(x, y+float64(i)*bh, w, bh+0.5))
-	}
+	_ = c.GradientFillRectanglePixels(from, to, walk.Vertical, u.r(x, y, w, h))
 }
 
 // vgradPx is vgrad in device pixels, for surfaces that are not part of the
 // design grid (the sidebar strip and the canvas behind it run edge to edge at
 // any window size, so they must not be letterboxed with the cards).
+//
+// It uses GDI's GradientFill rather than a stack of 64 mixed rectangles. The
+// bands were the single largest source of GDI churn: each band asked for a
+// brush of a slightly different colour, and because the mix is computed from
+// floats, almost every band produced a colour that had never been requested
+// before - so the brush cache could never reuse one and grew by ~64 handles
+// every frame. GradientFill does the whole ramp in one call with no brush at
+// all, and it also removes the visible banding.
 func (u *natUI) vgradPx(c *walk.Canvas, r walk.Rectangle, from, to walk.Color) {
-	const steps = 64
-	bh := float64(r.Height) / float64(steps)
-	for i := 0; i < steps; i++ {
-		t := float64(i) / float64(steps-1)
-		u.fillRect(c, mix(from, to, t), walk.Rectangle{
-			X:      r.X,
-			Y:      r.Y + int(float64(i)*bh+0.5),
-			Width:  r.Width,
-			Height: int(bh + 1.5),
-		})
-	}
+	_ = c.GradientFillRectanglePixels(from, to, walk.Vertical, r)
 }
 
 // rowToggle is a labelled switch with an optional second line.
@@ -916,3 +991,8 @@ func (u *natUI) flagChip(c *walk.Canvas, x, y, w, h float64, cc string) {
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
+
+// TEMP DIAGNOSTIC (remove after measurement)
+func (u *natUI) diagCacheSize() string {
+	return fmt.Sprintf("brushes=%d pens=%d wpens=%d", len(u.brushes), len(u.pens), len(u.wpens))
+}

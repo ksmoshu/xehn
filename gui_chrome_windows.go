@@ -1,4 +1,4 @@
-//go:build windows
+﻿//go:build windows
 
 package main
 
@@ -52,7 +52,7 @@ func windowDPI(hwnd uintptr) float64 {
 // stripCaptionBar removes WS_CAPTION from the window, which turns the native
 // title bar into client area (the frame stays, so resizing and maximise keep
 // working) and gives the page the whole top edge. Everything that used to be
-// drawn by Windows — title, icon, buttons — is now ours.
+// drawn by Windows 鈥?title, icon, buttons 鈥?is now ours.
 func (u *natUI) stripCaptionBar() {
 	if u.mw == nil {
 		return
@@ -135,7 +135,7 @@ func maxDesignClient(workW, workH, fw, fh int32) (int32, int32) {
 
 // defaultClientSize is the startup client area: the design grid at the display's
 // DPI, so a 200% screen gets a twice-as-large window instead of a half-size one
-// with tiny text. It is capped at 90% of the work area — both axes by the same
+// with tiny text. It is capped at 90% of the work area 鈥?both axes by the same
 // factor, so the 1080:734 ratio survives the cap.
 func defaultClientSize(dpi float64, workW, workH, fw, fh int32) (int32, int32) {
 	cw := designW * dpi / 96
@@ -398,7 +398,6 @@ func (u *natUI) capLine(c *walk.Canvas, col walk.Color, x1, y1, x2, y2, w float6
 	if p == nil {
 		return
 	}
-	defer p.Dispose()
 	_ = c.DrawLinePixels(p, u.capPoint(x1, y1), u.capPoint(x2, y2))
 }
 

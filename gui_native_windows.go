@@ -229,6 +229,15 @@ type natUI struct {
 	fonts []fontSpec
 	fontK float64
 
+	// GDI handles owned by this window for its whole life. A full repaint
+	// allocates hundreds of brushes and pens if every fill creates its own,
+	// and the status loop repaints twice a second - which is how the process
+	// used to reach Windows' 10,000-handle ceiling and paint solid black.
+	// See gui_draw_windows.go's brush/pen/penW and disposeGdiCache.
+	brushes map[walk.Color]*walk.SolidColorBrush
+	pens    map[walk.Color]*walk.CosmeticPen
+	wpens   map[widePenKey]*walk.GeometricPen
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -347,10 +356,13 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	mw.SetMinMaxSizePixels(walk.Size{Width: 800, Height: 544}, walk.Size{})
 
 	u := &natUI{
-		mw:  mw,
-		m:   newNatModel(),
-		sp:  make([]spot, 0, 128),
-		ctx: ctx,
+		mw:      mw,
+		m:       newNatModel(),
+		sp:      make([]spot, 0, 128),
+		ctx:     ctx,
+		brushes: make(map[walk.Color]*walk.SolidColorBrush),
+		pens:    make(map[walk.Color]*walk.CosmeticPen),
+		wpens:   make(map[widePenKey]*walk.GeometricPen),
 	}
 
 	// Preferences first, so the window opens with the theme and language the
@@ -475,9 +487,11 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	u.setWindowIcon()
 	u.invalidate()
 
-	// The licence reminder comes first: it is a condition of using this build,
-	// and it must not be buried under an auto-connect pipeline or a scan.
-	u.showStartupNotice()
+	// The startup licence notice is no longer shown: the same sentence stays
+	// at the foot of the About page, so the build still carries the reminder
+	// without a modal that has to be dismissed before the window is usable.
+	// showStartupNotice is kept intact so the text can be restored by flipping
+	// this flag back.
 
 	// Auto-connect starts here, after the window exists: the connect pipeline
 	// posts its progress through Synchronize, which is a PostMessage and simply
@@ -519,6 +533,7 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	releaseHealthOwner(os.Getpid())
 	u.disposeFonts()
 	disposeLogo()
+	u.disposeGdiCache()
 	cw.Dispose()
 	mw.Dispose()
 	return nil
